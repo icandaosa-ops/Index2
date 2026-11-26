@@ -21923,6 +21923,7 @@ function usrRender(){
           return '<div class="us-mr us-mm"><b>'+esc(m[1])+'</b><small>Se comparte entre quienes tengan acceso.</small><span class="us-mc">'+usrN(usrCuenta(m[0]))+'</span></div>';
         }).join('');
     }).join('')+'</div></section>';
+  if(usrPuedo()) h+='<section class="panel us-copia" aria-label="Copia de los datos"><div class="ph"><h2>Copia de los datos</h2></div><div class="pad"><p class="hint">Baja una copia completa de la información y de los archivos adjuntos, para guardarla o para armar la versión que se publica en GitHub. Los adjuntos van en varios ZIP.</p><div class="us-cb"><button type="button" class="btn" data-a="usr-copia">Descargar copia de datos</button> <button type="button" class="btn" data-a="usr-adj">Preparar adjuntos</button></div><div id="usrAdj">'+usrAdjHtml()+'</div></div></section>';
   h+='<p class="hint us-nota">Cada persona entra con su usuario y su contraseña, y puede cambiarla cuando quiera desde «Mi cuenta» (tocando su nombre, arriba a la derecha). Las contraseñas no se guardan: solo una huella que no se puede leer. Si alguien se la olvida, se la restablece desde acá. El control es de la app: lo que protege los datos de verdad es con quién se comparte el enlace de la página.</p>';
   el.innerHTML=h;
 }
@@ -21932,6 +21933,109 @@ function usrWr(fn){
   return wr(fn).finally(function(){ AC.pend-- });
 }
 function usrSet(r){ return usrWr(function(){ return db.collection(AC_COL).doc(r.id).set(acDoc(r)) }) }
+
+/* ----- copia de los datos y de los adjuntos (solo administradores) ----- */
+var USR_COLS=['usuarios','personal','novedades','eventos','accesos','adelantos','asistencia','asisthist','cobmedica','cuotaalim','difusion','gestionventa','horasextras','organigrama','plusfuncion','proyectos','reclutamiento','reuniones','salamaternal','seguimiento','sueldos','sume','vacaciones','vacsaldos','tablerodiario','transporte','hys_cap','hys_com','hys_con','hys_des','hys_dirs','hys_docs','hys_eventos','hys_ext','hys_extrev','hys_leg','hys_mej','hys_meta','hys_reu','hys_sin'];
+var USR_ADJ={parts:null,busy:false,msg:''};
+function usrLeerCol(c){
+  return new Promise(function(ok,ko){
+    var un=null, hecho=false, t=setTimeout(function(){ if(!hecho){ hecho=true; ko(new Error('Sin respuesta de '+c)) } },20000);
+    try{
+      un=db.collection(c).onSnapshot(function(snap){
+        if(hecho) return; hecho=true; clearTimeout(t);
+        var r=snap.docs.map(function(d){ return {id:d.id,d:d.data()||{}} });
+        try{ if(typeof un==='function') un() }catch(e){}
+        ok(r);
+      },function(e){ if(hecho) return; hecho=true; clearTimeout(t); ko(e||new Error('Error en '+c)) });
+    }catch(e){ clearTimeout(t); ko(e) }
+  });
+}
+async function usrGuardarArchivo(nombre,blob){
+  try{ await S.dl.save({filename:nombre,data:blob}); return true }
+  catch(e){ if(e&&e.code==='declined') return false; throw e }
+}
+async function usrCopia(){
+  var out={}, n=0, i, c, docs, res=[];
+  if(!usrPuedo()){ toast('Solo un administrador puede bajar la copia.'); return }
+  if(!S.dl){ toast('Desde esta vista no se puede descargar.'); return }
+  if(USR_ADJ.busy) return; USR_ADJ.busy=true;
+  toast('Preparando la copia…');
+  try{
+    for(i=0;i<USR_COLS.length;i++){
+      c=USR_COLS[i]; docs=await usrLeerCol(c); out[c]={};
+      docs.forEach(function(x){ out[c][x.id]=x.d; n++ });
+      res.push(c+': '+docs.length);
+    }
+    var json=JSON.stringify({formato:'holliday-datos',version:1,generado:new Date().toISOString(),total:n,colecciones:out});
+    var blob=new Blob([json],{type:'application/json'}), nom='holliday-datos-'+S.hoy+'.json', ok;
+    try{ ok=await usrGuardarArchivo(nom,blob) }
+    catch(e){ ok=await usrGuardarArchivo(nom+'.txt',new Blob([json],{type:'text/plain'})) }
+    toast(ok?'Copia guardada: '+n+' registros.':'No se guardó el archivo.');
+  }catch(e){ console.error(e); toast('No se pudo armar la copia. Probá de nuevo.') }
+  finally{ USR_ADJ.busy=false }
+}
+var USR_EXT={'application/pdf':'pdf','image/jpeg':'jpg','image/png':'png','image/webp':'webp','image/gif':'gif','image/svg+xml':'svg','text/plain':'txt','text/csv':'csv'};
+function usrAdjHtml(){
+  var p=USR_ADJ.parts, h='';
+  if(USR_ADJ.msg) h+='<p class="hint">'+esc(USR_ADJ.msg)+'</p>';
+  if(!p) return h;
+  h+='<div class="us-cb">'+p.map(function(x,i){ return '<button type="button" class="btn" data-a="usr-adjp" data-v="'+i+'">Parte '+(i+1)+' de '+p.length+' · '+x.length+' archivos · '+Math.round(x.mb)+' MB</button>' }).join(' ')+'</div>';
+  return h;
+}
+function usrAdjPaint(){ var el=document.getElementById('usrAdj'); if(el) el.innerHTML=usrAdjHtml() }
+async function usrAdjPreparar(){
+  var as=(S.cu&&S.cu.as)||(typeof RC!=='undefined'&&RC.as)||null, r, l, parts=[], cur=null, mb=0;
+  if(!usrPuedo()) return;
+  if(!as||typeof as.list!=='function'){ USR_ADJ.msg='No se pudo leer la lista de adjuntos: tu usuario de Claude no tiene permiso de edición.'; usrAdjPaint(); return }
+  USR_ADJ.msg='Leyendo la lista de adjuntos…'; usrAdjPaint();
+  try{
+    r=await as.list(); l=(r&&r.assets)||[];
+    l.forEach(function(a){
+      var sz=(a.sizeBytes!=null?a.sizeBytes:a.size_bytes)||0, ct=a.contentType||a.content_type||'', e={id:a.id||a.opaque_id,url:a.url,ext:USR_EXT[ct]||'bin',sz:sz};
+      if(!cur||cur.mb+sz/1048576>20){ cur=[]; cur.mb=0; parts.push(cur) }
+      cur.push(e); cur.mb+=sz/1048576;
+    });
+    USR_ADJ.parts=parts; USR_ADJ.msg=l.length+' adjuntos en '+parts.length+' partes. Bajá cada parte y descomprimila en la carpeta «adjuntos» del repositorio.';
+  }catch(e){ console.error(e); USR_ADJ.msg='No se pudo leer la lista de adjuntos.' }
+  usrAdjPaint();
+}
+var UC_T=null;
+function ucCrc(u){
+  var c, n, k, i;
+  if(!UC_T){ UC_T=new Uint32Array(256); for(n=0;n<256;n++){ c=n; for(k=0;k<8;k++) c=c&1?0xEDB88320^(c>>>1):c>>>1; UC_T[n]=c>>>0 } }
+  c=0xFFFFFFFF; for(i=0;i<u.length;i++) c=UC_T[(c^u[i])&255]^(c>>>8);
+  return (c^0xFFFFFFFF)>>>0;
+}
+function ucZip(files){   // ZIP sin compresión (los PDF e imágenes ya vienen comprimidos)
+  var enc=new TextEncoder(), parts=[], cen=[], off=0, cs=0;
+  files.forEach(function(f){
+    var nm=enc.encode(f.n), crc=ucCrc(f.d), sz=f.d.length, h=new DataView(new ArrayBuffer(30)), c=new DataView(new ArrayBuffer(46));
+    h.setUint32(0,0x04034b50,true); h.setUint16(4,20,true); h.setUint16(6,0x0800,true); h.setUint16(12,0x21,true); h.setUint32(14,crc,true); h.setUint32(18,sz,true); h.setUint32(22,sz,true); h.setUint16(26,nm.length,true);
+    parts.push(h.buffer,nm,f.d);
+    c.setUint32(0,0x02014b50,true); c.setUint16(4,20,true); c.setUint16(6,20,true); c.setUint16(8,0x0800,true); c.setUint16(14,0x21,true); c.setUint32(16,crc,true); c.setUint32(20,sz,true); c.setUint32(24,sz,true); c.setUint16(28,nm.length,true); c.setUint32(42,off,true);
+    cen.push(c.buffer,nm); off+=30+nm.length+sz; cs+=46+nm.length;
+  });
+  var e=new DataView(new ArrayBuffer(22));
+  e.setUint32(0,0x06054b50,true); e.setUint16(8,files.length,true); e.setUint16(10,files.length,true); e.setUint32(12,cs,true); e.setUint32(16,off,true);
+  return new Blob(parts.concat(cen,[e.buffer]),{type:'application/zip'});
+}
+async function usrAdjParte(i){
+  var p=USR_ADJ.parts&&USR_ADJ.parts[i], fs=[], k, rs, bf, ok;
+  if(!p||USR_ADJ.busy) return;
+  if(!S.dl){ toast('Desde esta vista no se puede descargar.'); return }
+  USR_ADJ.busy=true; toast('Armando la parte '+(i+1)+'…');
+  try{
+    for(k=0;k<p.length;k++){
+      rs=await fetch(p[k].url||('/_blob/'+p[k].id));
+      if(!rs.ok) throw new Error('No se pudo leer '+p[k].id);
+      bf=new Uint8Array(await rs.arrayBuffer());
+      fs.push({n:p[k].id+'.'+p[k].ext,d:bf});
+    }
+    ok=await usrGuardarArchivo('adjuntos-parte-'+('0'+(i+1)).slice(-2)+'-de-'+('0'+USR_ADJ.parts.length).slice(-2)+'.zip',ucZip(fs));
+    toast(ok?'Parte '+(i+1)+' guardada.':'No se guardó el archivo.');
+  }catch(e){ console.error(e); toast('No se pudo armar la parte '+(i+1)+'. Probá de nuevo.') }
+  finally{ USR_ADJ.busy=false }
+}
 function usrUpd(id,campos){ return usrWr(function(){ return db.collection(AC_COL).doc(id).update(campos) }) }
 /* ----- ficha de una persona ----- */
 function usrAbrirPersona(id){
@@ -25750,6 +25854,9 @@ document.addEventListener('click',function(e){
   if(a.indexOf('usr-')!==0&&a.indexOf('ac-')!==0) return;
   switch(a){
     case 'usr-nueva': usrAbrirPersona(''); break;
+    case 'usr-copia': usrCopia(); break;
+    case 'usr-adj': usrAdjPreparar(); break;
+    case 'usr-adjp': usrAdjParte(+v); break;
     case 'usr-edit': usrAbrirPersona(id); break;
     case 'usr-clave': usrAbrirClave(id); break;
     case 'usr-act': usrAccion('act',id); break;
