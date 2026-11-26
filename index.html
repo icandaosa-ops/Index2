@@ -15,6 +15,7 @@
       var D=EMB;
       if(x&&x.formato==='holliday-datos'&&x.colecciones&&(!EMB||String(x.generado||'')>String(EMB.generado||''))) D=x;
       if(D) iniciar(D);
+      return D&&D.archivos?importar(D.archivos):null;
     });
   })();
   function cp(o){ return JSON.parse(JSON.stringify(o)) }
@@ -34,6 +35,28 @@
       update:function(p){ var m=col(c); if(!(id in m)) return Promise.reject(new Error('not-found')); put(c,id,Object.assign({},m[id],p)); return Promise.resolve() },
       delete:function(){ (ov[c]=ov[c]||{})[id]=null; save(); emit(c); return Promise.resolve() }};
   }
+  /* Archivos que se suben desde la página: se guardan en este navegador (IndexedDB) y viajan dentro de la copia de datos («archivos») */
+  var IDBP=null;
+  function idb(){ return IDBP||(IDBP=new Promise(function(ok,ko){ var r=indexedDB.open('holliday-archivos',1); r.onupgradeneeded=function(){ r.result.createObjectStore('f',{keyPath:'id'}) }; r.onsuccess=function(){ ok(r.result) }; r.onerror=function(){ ko(r.error) } })) }
+  function tx(mode,fn){ return idb().then(function(d){ return new Promise(function(ok,ko){ var t=d.transaction('f',mode), q=fn(t.objectStore('f')); t.oncomplete=function(){ ok(q&&q.result) }; t.onerror=function(){ ko(t.error) }; t.onabort=function(){ ko(t.error) } }) }) }
+  function b64(buf){ var u=new Uint8Array(buf), s='', i; for(i=0;i<u.length;i+=8192) s+=String.fromCharCode.apply(null,u.subarray(i,i+8192)); return btoa(s) }
+  function deB64(t,type){ var b=atob(t), u=new Uint8Array(b.length), i; for(i=0;i<b.length;i++) u[i]=b.charCodeAt(i); return new Blob([u],{type:type||'application/octet-stream'}) }
+  function importar(arch){
+    var ids=Object.keys(arch||{}); if(!ids.length) return Promise.resolve();
+    return tx('readonly',function(s){ return s.getAllKeys() }).then(function(have){
+      have=have||[]; var falta=ids.filter(function(i){ return have.indexOf(i)<0 });
+      return falta.reduce(function(p,id){ return p.then(function(){ var a=arch[id]; return tx('readwrite',function(s){ return s.put({id:id,type:a.t,name:a.n,size:a.s||0,blob:deB64(a.b,a.t)}) }) }) },Promise.resolve());
+    }).catch(function(e){ console.error('Archivos',e) });
+  }
+  function todos(){ return tx('readonly',function(s){ return s.getAll() }).then(function(l){ return l||[] }) }
+  var assets={
+    upload:function(file,o){
+      var id='u'+Date.now().toString(36)+Math.random().toString(36).slice(2,8), type=file.type||(o&&o.type)||'application/octet-stream';
+      return tx('readwrite',function(s){ return s.put({id:id,type:type,name:file.name||id,size:file.size,blob:file}) }).then(function(){ return {id:id,url:'/_blob/'+id,sizeBytes:file.size,contentType:type} });
+    },
+    list:function(){ return todos().then(function(l){ return {assets:l.map(function(f){ return {id:f.id,url:'/_blob/'+f.id,sizeBytes:f.size,contentType:f.type} }),usage:{files:l.length}} }) },
+    'delete':function(id){ return tx('readwrite',function(s){ return s.delete(id) }) }
+  };
   var db={collection:function(c){
     return {doc:function(id){ return docRef(c,id) },
       add:function(d){ var id=rid(); put(c,id,d); return Promise.resolve({id:id}) },
@@ -41,22 +64,39 @@
       onSnapshot:function(f,e){ (subs[c]=subs[c]||[]).push(f); setTimeout(function(){ try{ f(snap(c)) }catch(x){ console.error(x) } },0); return function(){ subs[c]=(subs[c]||[]).filter(function(g){ return g!==f }) } }};
   }};
   var user={isOwner:function(){ return false }, canEdit:function(){ return true }, can:function(){ return true }, id:function(){ return Promise.resolve('local') }, me:function(){ return Promise.resolve({id:'local',name:''}) }, profiles:function(){ return Promise.resolve({}) }};
-  var dl={save:function(o){
-    return new Promise(function(ok,ko){
+  function conArchivos(o){
+    if(!o||!o.data||!/^holliday-datos-.*\.json(\.txt)?$/.test(o.filename||'')) return Promise.resolve(o);
+    return Promise.all([o.data.text(),todos()]).then(function(r){
+      var j=JSON.parse(r[0]), a={}, l=r[1];
+      return l.reduce(function(p,f){ return p.then(function(){ return f.blob.arrayBuffer().then(function(buf){ a[f.id]={t:f.type,n:f.name,s:f.size,b:b64(buf)} }) }) },Promise.resolve()).then(function(){
+        j.archivos=a; return {filename:o.filename,data:new Blob([JSON.stringify(j)],{type:o.data.type})};
+      });
+    }).catch(function(e){ console.error(e); return o });
+  }
+  var dl={save:function(o0){
+    return conArchivos(o0).then(function(o){ return new Promise(function(ok,ko){
       try{ var u=URL.createObjectURL(o.data), a=document.createElement('a'); a.href=u; a.download=o.filename; a.rel='noopener'; document.body.appendChild(a); a.click(); setTimeout(function(){ a.remove(); URL.revokeObjectURL(u) },2000); ok({}) }catch(e){ ko(e) }
-    });
+    }) });
   }};
-  var CAP={get db(){ return ready?db:null },user:user,downloads:dl,assets:null};
+  var CAP={get db(){ return ready?db:null },user:user,downloads:dl,assets:window.indexedDB?assets:null};
   window.claude={use:function(n){ return cargado.then(function(){ return CAP[n]||null }) }};
   /* Adjuntos: /_blob/<id> → adjuntos/<id>.<ext> (carpeta del repositorio) */
+  function localId(u){ var m=/^\/_blob\/([A-Za-z0-9]+)/.exec(u||''); return m&&!ADJ[m[1]]?m[1]:null }
   function adjUrl(u){ var m=/^\/_blob\/([A-Za-z0-9]+)/.exec(u||''); return m&&ADJ[m[1]]?'adjuntos/'+m[1]+'.'+ADJ[m[1]]:null }
   document.addEventListener('click',function(e){
     var a=e.target&&e.target.closest?e.target.closest('a[href^="/_blob/"]'):null; if(!a) return;
-    var u=adjUrl(a.getAttribute('href')); e.preventDefault(); e.stopPropagation();
-    if(u) window.open(u,'_blank','noopener'); else alert('Este adjunto no está disponible en esta versión.');
+    var h=a.getAttribute('href'), u=adjUrl(h), li=localId(h), w; e.preventDefault(); e.stopPropagation();
+    if(u){ window.open(u,'_blank','noopener'); return }
+    if(li&&window.indexedDB){
+      w=window.open('','_blank');
+      tx('readonly',function(s){ return s.get(li) }).then(function(f){ if(f&&w) w.location.href=URL.createObjectURL(f.blob); else{ if(w) w.close(); alert('Este adjunto no está disponible en esta versión.') } },function(){ if(w) w.close() });
+      return;
+    }
+    alert('Este adjunto no está disponible en esta versión.');
   },true);
-  function fixImgs(r){ (r.querySelectorAll?r.querySelectorAll('img[src^="/_blob/"]'):[]).forEach(function(i){ var u=adjUrl(i.getAttribute('src')); if(u) i.src=u }) }
-  new MutationObserver(function(ms){ ms.forEach(function(m){ m.addedNodes.forEach(function(n){ if(n.nodeType===1){ if(n.matches&&n.matches('img[src^="/_blob/"]')){ var u=adjUrl(n.getAttribute('src')); if(u) n.src=u } fixImgs(n) } }) }) }).observe(document.documentElement,{childList:true,subtree:true});
+  function fixImg(i){ var s=i.getAttribute('src'), u=adjUrl(s), li=localId(s); if(u) i.src=u; else if(li&&window.indexedDB) tx('readonly',function(x){ return x.get(li) }).then(function(f){ if(f) i.src=URL.createObjectURL(f.blob) }) }
+  function fixImgs(r){ (r.querySelectorAll?r.querySelectorAll('img[src^="/_blob/"]'):[]).forEach(fixImg) }
+  new MutationObserver(function(ms){ ms.forEach(function(m){ m.addedNodes.forEach(function(n){ if(n.nodeType===1){ if(n.matches&&n.matches('img[src^="/_blob/"]')) fixImg(n); fixImgs(n) } }) }) }).observe(document.documentElement,{childList:true,subtree:true});
 })();
 </script><title>Holliday – Administración de personal</title>
 <meta name="claude:viewport-fit-sides" content="cover">
@@ -3371,6 +3411,7 @@ body .nav>button.nav-i{flex:none;white-space:nowrap;line-height:inherit}
     </nav>
     <div class="ac-side">
       <button type="button" class="nav-i ac-ub" id="navUsr" data-a="mod" data-v="usr" hidden aria-label="Usuarios y accesos" title="Usuarios y accesos"><svg class="i" viewBox="0 0 20 20" aria-hidden="true"><path d="M10 2.5l6 2.3v4.4c0 3.6-2.5 6.4-6 8.3-3.5-1.9-6-4.7-6-8.3V4.8l6-2.3zM7.3 10l2 2 3.6-3.8"/></svg><span class="ac-ut">Usuarios y accesos</span></button>
+      <button type="button" class="nav-i ac-ub" id="navTema" data-a="ac-tema" aria-label="Cambiar entre modo claro y oscuro" title="Tema"><svg class="i" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="6.5"/><path d="M10 3.5v13a6.5 6.5 0 0 0 0-13z" fill="currentColor"/></svg><span class="ac-ut">Tema</span></button>
       <button type="button" class="nav-i ac-ub" id="navManual" data-a="ac-manual" hidden aria-label="Manual de uso (PDF)" title="Descargar el manual de uso (PDF)"><svg class="i" viewBox="0 0 20 20" aria-hidden="true"><path d="M4.5 4.2A1.7 1.7 0 0 1 6.2 2.5H15.5v12.8H6.2a1.7 1.7 0 0 0-1.7 1.7zM4.5 17A1.7 1.7 0 0 0 6.2 18.5H15.5v-3.2M8 6h4.5M8 9h4.5"/></svg><span class="ac-ut">Manual</span></button>
       <button type="button" class="ac-yo" id="acYo" data-a="ac-cuenta" hidden aria-label="Mi cuenta" title="Mi cuenta"></button>
       <button type="button" class="nav-i ac-ub" id="acSalir" data-a="ac-salir" hidden aria-label="Salir" title="Salir (para entrar con otro usuario)"><svg class="i" viewBox="0 0 20 20" aria-hidden="true"><path d="M8 3.5H5.5a1 1 0 0 0-1 1v11a1 1 0 0 0 1 1H8M12 6.5l3.5 3.5-3.5 3.5M15.5 10H8.5"/></svg><span class="ac-ut">Salir</span></button>
@@ -25930,6 +25971,7 @@ document.addEventListener('click',function(e){
     case 'ac-cuenta': acAbrirCuenta(); break;
     case 'ac-clave': acAbrirCambio(); break;
     case 'ac-salir': acSalir(); break;
+    case 'ac-tema': temaCiclo(); break;
   }
 });
 document.addEventListener('submit',function(e){
@@ -28767,6 +28809,21 @@ document.addEventListener('change',function(e){
 $('#reuTabs').innerHTML=RE_TABS.map(function(t){ return '<button type="button" role="tab" data-a="reu-tab" data-v="'+t[0]+'" aria-selected="'+(t[0]===REU.tab)+'">'+esc(t[1])+'</button>' }).join('');
 
 renderAll(); previewRapido();
+
+/* ----- Tema: automático (según el equipo), claro u oscuro ----- */
+var TEMA_K='holliday.tema', TEMA_N={auto:'Automático',light:'Claro',dark:'Oscuro'};
+function temaGet(){ try{ var v=localStorage.getItem(TEMA_K); return v==='light'||v==='dark'?v:'auto' }catch(e){ return 'auto' } }
+function temaAplicar(t){
+  var r=document.documentElement, b=document.getElementById('navTema'), s;
+  if(t==='auto') r.removeAttribute('data-theme'); else r.setAttribute('data-theme',t);
+  if(b){ b.title='Tema: '+TEMA_N[t]+' · tocá para cambiar'; b.setAttribute('aria-label','Tema: '+TEMA_N[t]+'. Tocá para cambiar entre automático, claro y oscuro'); s=b.querySelector('.ac-ut'); if(s) s.textContent='Tema: '+TEMA_N[t] }
+}
+function temaCiclo(){
+  var t=temaGet(), n=t==='auto'?'light':(t==='light'?'dark':'auto');
+  try{ if(n==='auto') localStorage.removeItem(TEMA_K); else localStorage.setItem(TEMA_K,n) }catch(e){}
+  temaAplicar(n);
+}
+temaAplicar(temaGet());
 
 /* ---------- Datos ---------- */
 (async function(){
