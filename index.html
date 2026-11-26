@@ -15,6 +15,7 @@
       var D=EMB;
       if(x&&x.formato==='holliday-datos'&&x.colecciones&&(!EMB||String(x.generado||'')>String(EMB.generado||''))) D=x;
       if(D) iniciar(D);
+      if(D&&D.configuracion&&D.configuracion.claveApi) SHARED=String(D.configuracion.claveApi);
       return D&&D.archivos?importar(D.archivos):null;
     });
   })();
@@ -57,6 +58,83 @@
     list:function(){ return todos().then(function(l){ return {assets:l.map(function(f){ return {id:f.id,url:'/_blob/'+f.id,sizeBytes:f.size,contentType:f.type} }),usage:{files:l.length}} }) },
     'delete':function(id){ return tx('readwrite',function(s){ return s.delete(id) }) }
   };
+
+  /* ===== Asistente / lectura de CV: llama a la API de Anthropic directamente desde el navegador (clave de API propia) ===== */
+  var KLS='holliday.claveapi', KSH='holliday.claveapi.compartir', SHARED='', MODELOS={quick:'claude-haiku-5-5','default':'claude-sonnet-5-5',complex:'claude-opus-5-5'};
+  function lsGet(k){ try{ return localStorage.getItem(k)||'' }catch(e){ return '' } }
+  function lsSet(k,v){ try{ if(v) localStorage.setItem(k,v); else localStorage.removeItem(k) }catch(e){} }
+  function claveActual(){ return lsGet(KLS)||SHARED }
+  function errIA(code,msg){ var e=new Error(msg); e.code=code; return e }
+  function pedirClave(){
+    return new Promise(function(ok){
+      var ov=document.createElement('div'), prev=document.activeElement;
+      ov.setAttribute('role','dialog'); ov.setAttribute('aria-modal','true'); ov.setAttribute('aria-label','Clave de API del asistente');
+      ov.style.cssText='position:fixed;inset:0;z-index:2147483000;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;padding:16px;font:14px/1.45 system-ui,sans-serif';
+      ov.innerHTML='<form style="background:#fff;color:#14232a;max-width:460px;width:100%;border-radius:14px;padding:22px;box-shadow:0 10px 40px rgba(0,0,0,.4)">'+
+        '<h2 style="margin:0 0 8px;font-size:18px">Clave de API del asistente</h2>'+
+        '<p style="margin:0 0 12px;color:#3d5560">El asistente usa la inteligencia de Claude y necesita una clave de API de Anthropic (empieza con <b>sk-ant-</b>). Se guarda solo en este navegador.</p>'+
+        '<input type="password" id="hk-k" autocomplete="off" spellcheck="false" placeholder="sk-ant-…" style="width:100%;padding:10px;border:1px solid #9bb0b8;border-radius:8px;font:inherit;box-sizing:border-box">'+
+        '<label style="display:flex;gap:8px;align-items:flex-start;margin:12px 0 4px"><input type="checkbox" id="hk-c" style="margin-top:3px"><span>Compartirla con todo el equipo: queda dentro de la copia de datos y <b>visible para cualquiera que abra el repositorio</b>. Usá una clave con límite de gasto.</span></label>'+
+        '<p id="hk-e" style="color:#b3261e;margin:8px 0 0;min-height:18px" role="alert"></p>'+
+        '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px"><button type="button" id="hk-n" style="padding:9px 14px;border-radius:8px;border:1px solid #9bb0b8;background:#fff;font:inherit;cursor:pointer">Cancelar</button><button type="submit" style="padding:9px 14px;border-radius:8px;border:0;background:#0f6d63;color:#fff;font:inherit;cursor:pointer">Guardar</button></div></form>';
+      document.body.appendChild(ov);
+      var f=ov.querySelector('form'), k=ov.querySelector('#hk-k'), c=ov.querySelector('#hk-c'), er=ov.querySelector('#hk-e');
+      function cerrar(v){ ov.remove(); try{ if(prev&&prev.focus) prev.focus() }catch(e){} ok(v) }
+      f.addEventListener('submit',function(e){ e.preventDefault(); var v=k.value.trim(); if(!/^sk-ant-[A-Za-z0-9_\-]{20,}$/.test(v)){ er.textContent='La clave no tiene el formato esperado (sk-ant-…).'; k.focus(); return } lsSet(KLS,v); lsSet(KSH,c.checked?'1':''); cerrar(v) });
+      ov.querySelector('#hk-n').addEventListener('click',function(){ cerrar('') });
+      ov.addEventListener('keydown',function(e){ if(e.key==='Escape'){ e.stopPropagation(); cerrar('') } });
+      setTimeout(function(){ k.focus() },30);
+    });
+  }
+  function aBlobB64(bl){ return bl.arrayBuffer().then(function(b){ return b64(b) }) }
+  function pedirIA(body,signal,reintento){
+    return fetch('https://api.anthropic.com/v1/messages',{method:'POST',signal:signal,headers:{'content-type':'application/json','x-api-key':claveActual(),'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},body:JSON.stringify(body)})
+      .catch(function(e){ if(e&&e.name==='AbortError') throw e; throw errIA('network','No hay conexión con el servicio de IA.') })
+      .then(function(r){
+        return r.json().catch(function(){ return null }).then(function(j){
+          if(r.ok) return j;
+          var m=(j&&j.error&&j.error.message)||('Error '+r.status);
+          if(r.status===401||r.status===403){ if(lsGet(KLS)){ lsSet(KLS,''); lsSet(KSH,'') } throw errIA('invalid_key','La clave de API no es válida o no tiene permiso. '+(SHARED&&!lsGet(KLS)?'Pedile al administrador que la actualice.':'Se te va a pedir de nuevo.')) }
+          if(r.status===429) throw errIA('rate_limited',m);
+          if((r.status===529||r.status>=500)&&!reintento) return new Promise(function(res){ setTimeout(res,1500) }).then(function(){ return pedirIA(body,signal,true) });
+          throw errIA('api_error',m);
+        });
+      });
+  }
+  function aTexto(v){ var t=typeof v==='string'?v:JSON.stringify(v===undefined?null:v); return t.length>60000?t.slice(0,60000)+'\n[…recortado]':t }
+  async function muestrear(input,opts){
+    opts=opts||{};
+    if(!claveActual()){ if(!(await pedirClave())) throw errIA('no_key','Falta configurar la clave de API del asistente.') }
+    var msgs=(typeof input==='string'?[{role:'user',content:input}]:input).map(function(m){ return {role:m.role,content:m.content} }), signal=opts.signal, tools=(opts.tools||[]), mp={}, vuelta=0, res, bt, txt, usos, rs, k;
+    if(opts.images&&opts.images.length){
+      var im=await Promise.all(opts.images.map(function(b){ return aBlobB64(b).then(function(d){ var t=b.type||'image/jpeg'; if(!/^image\/(jpeg|png|gif|webp)$/.test(t)) t='image/jpeg'; return {type:'image',source:{type:'base64',media_type:t,data:d}} }) }));
+      var u=msgs[msgs.length-1]; u.content=im.concat([{type:'text',text:String(u.content)}]);
+    }
+    var body={model:MODELOS[opts.modelTier]||MODELOS['default'],max_tokens:8192,messages:msgs};
+    if(tools.length){ body.tools=tools.map(function(t){ mp[t.name]=t; return {name:t.name,description:t.description||'',input_schema:t.inputSchema||{type:'object',properties:{}}} }); body.tools[body.tools.length-1].cache_control={type:'ephemeral'} }
+    for(;;){
+      if(signal&&signal.aborted){ var ab=errIA('aborted','Detenido'); ab.name='AbortError'; throw ab }
+      res=await pedirIA(body,signal);
+      bt=res.content||[]; msgs.push({role:'assistant',content:bt});
+      txt=bt.filter(function(b){ return b.type==='text' }).map(function(b){ return b.text }).join('');
+      if(txt&&opts.onText){ try{ opts.onText({text:txt,delta:txt}) }catch(e){} }
+      usos=bt.filter(function(b){ return b.type==='tool_use' });
+      if(res.stop_reason!=='tool_use'||!usos.length) return {text:txt,truncated:res.stop_reason==='max_tokens'};
+      if(++vuelta>14) return {text:txt||'No pude terminar la consulta: hizo demasiados pasos.',truncated:true};
+      rs=[];
+      for(k=0;k<usos.length;k++){
+        var tu=usos[k], t=mp[tu.name], o;
+        if(signal&&signal.aborted){ var ab2=errIA('aborted','Detenido'); ab2.name='AbortError'; throw ab2 }
+        try{ if(!t) throw new Error('Herramienta desconocida: '+tu.name); o={type:'tool_result',tool_use_id:tu.id,content:aTexto(await t.execute(tu.input||{}))} }
+        catch(e){ o={type:'tool_result',tool_use_id:tu.id,content:String((e&&e.message)||e||'Error').slice(0,500),is_error:true} }
+        rs.push(o);
+      }
+      msgs.push({role:'user',content:rs});
+    }
+  }
+  var sampleFn=function(input,opts){ return muestrear(input,opts) };
+  sampleFn.limits=function(){ return Promise.resolve({images:true}) };
+  sampleFn.json=function(input,opts){ return muestrear(input,opts).then(function(r){ var a=r.text, i=a.indexOf('{'), j=a.lastIndexOf('}'); if(i<0||j<i) throw errIA('invalid_json','La respuesta no tenía el formato esperado.'); return JSON.parse(a.slice(i,j+1)) }) };
   var db={collection:function(c){
     return {doc:function(id){ return docRef(c,id) },
       add:function(d){ var id=rid(); put(c,id,d); return Promise.resolve({id:id}) },
@@ -69,7 +147,7 @@
     return Promise.all([o.data.text(),todos()]).then(function(r){
       var j=JSON.parse(r[0]), a={}, l=r[1];
       return l.reduce(function(p,f){ return p.then(function(){ return f.blob.arrayBuffer().then(function(buf){ a[f.id]={t:f.type,n:f.name,s:f.size,b:b64(buf)} }) }) },Promise.resolve()).then(function(){
-        j.archivos=a; return {filename:o.filename,data:new Blob([JSON.stringify(j)],{type:o.data.type})};
+        j.archivos=a; if(lsGet(KSH)==='1'&&lsGet(KLS)) j.configuracion={claveApi:lsGet(KLS)}; else if(SHARED&&!lsGet(KLS)) j.configuracion={claveApi:SHARED}; return {filename:o.filename,data:new Blob([JSON.stringify(j)],{type:o.data.type})};
       });
     }).catch(function(e){ console.error(e); return o });
   }
@@ -78,7 +156,7 @@
       try{ var u=URL.createObjectURL(o.data), a=document.createElement('a'); a.href=u; a.download=o.filename; a.rel='noopener'; document.body.appendChild(a); a.click(); setTimeout(function(){ a.remove(); URL.revokeObjectURL(u) },2000); ok({}) }catch(e){ ko(e) }
     }) });
   }};
-  var CAP={get db(){ return ready?db:null },user:user,downloads:dl,assets:window.indexedDB?assets:null};
+  var CAP={get db(){ return ready?db:null },user:user,downloads:dl,sample:sampleFn,assets:window.indexedDB?assets:null};
   window.claude={use:function(n){ return cargado.then(function(){ return CAP[n]||null }) }};
   /* Adjuntos: /_blob/<id> → adjuntos/<id>.<ext> (carpeta del repositorio) */
   function localId(u){ var m=/^\/_blob\/([A-Za-z0-9]+)/.exec(u||''); return m&&!ADJ[m[1]]?m[1]:null }
@@ -2828,6 +2906,9 @@ table.hs-tb .rc-b{white-space:nowrap}
 table.hs-tb td.hs-fd{width:128px;white-space:nowrap}
 table.hs-tb td.hs-vn{width:152px}
 table.hs-tb td.hs-leg{width:64px}
+table.hs-per td.hs-cuil{white-space:nowrap;font-variant-numeric:tabular-nums}
+.hs-per .hs-nm small.hs-cuil-m{display:none}
+@media (max-width:760px){ .hs-per .hs-cuilc{display:none} .hs-per .hs-nm small.hs-cuil-m{display:block} }
 
 /* Tema gris del área Higiene y seguridad | Gestión ambiental (Administración queda en verde azulado) */
 body.area-hys{
@@ -18384,10 +18465,11 @@ function hsPerToggle(k,v){
   hsPerRender();
   return i<0;
 }
+function hsCuil(c){ var d=String(c||'').replace(/\D/g,''); return d.length===11?d.slice(0,2)+'-'+d.slice(2,10)+'-'+d.slice(10):String(c||'').trim() }
 function hsPerOk(p,q){
   var f=HS.p.f, k;
   for(k in HS_FV) if(f[k].length&&f[k].indexOf(HS_FV[k](p))<0) return false;
-  if(q&&norm([p.nombre,p.leg,p.estab,p.sector,p.cat,p.tareas,hsAreaDe(p),(HS.leg[p.id]||{}).tareas||''].join(' ')).indexOf(q)<0) return false;
+  if(q&&norm([p.nombre,p.leg,p.estab,p.sector,p.cat,p.tareas,hsAreaDe(p),(HS.leg[p.id]||{}).tareas||'',hsCuil(p.cuil),String(p.cuil||'').replace(/\D/g,'')].join(' ')).indexOf(q)<0) return false;
   return true;
 }
 function hsOrden(a){
@@ -18452,7 +18534,7 @@ function hsPerRender(){
   var chips='';
   for(k in HS_FV) f[k].forEach(function(v){ chips+='<button type="button" class="hs-af" data-hs="per-f" data-w="c" data-k="'+k+'" data-v="'+esc(v)+'" title="Quitar este filtro"><small>'+esc(HS_FN[k])+':</small> '+esc(v)+' <span aria-hidden="true">×</span></button>' });
   h+='<section class="panel hs-main" id="hsPerLista"><div class="ph"><h2>Listado por establecimiento y sector</h2><span class="day-c">'+l.length+(l.length===1?' persona':' personas')+'</span></div>'+
-    '<div class="hs-fil"><input type="search" id="hsPerQ" data-hsf="pq" placeholder="Buscar por nombre, legajo, categoría o tarea…" value="'+esc(P.q)+'" aria-label="Buscar persona" autocomplete="off">'+
+    '<div class="hs-fil"><input type="search" id="hsPerQ" data-hsf="pq" placeholder="Buscar por nombre, legajo, CUIL, categoría o tarea…" value="'+esc(P.q)+'" aria-label="Buscar persona" autocomplete="off">'+
     (hay?'<button type="button" class="btn sm" id="hsPerClr" data-hs="per-clear">Quitar filtros</button>':'')+'</div>'+
     (chips?'<div class="hs-afs" role="group" aria-label="Filtros activos">'+chips+'</div>':'');
   if(!l.length) h+='<p class="muted pad">'+(all.length?'No hay personas con ese filtro.':'Todavía no hay personal cargado en Administración de personal.')+'</p>';
@@ -18470,15 +18552,16 @@ function hsPerRender(){
       if(!sg){ sg=g.sm[ks]={k:ks,l:[]}; g.s.push(sg) }
       sg.l.push(p); g.l.push(p); if(!hsTienePre(p.id)) g.sin++;
     });
-    h+='<div class="tbl-wrap"><table class="tbl hs-tb hs-per"><thead><tr><th>Leg.</th><th>Nombre y apellido</th><th class="hm">Categoría</th><th>Tipo de puesto</th><th class="hm">Tareas que realizan</th><th>Ingreso</th><th>Preocupacional</th><th></th></tr></thead>';
+    h+='<div class="tbl-wrap"><table class="tbl hs-tb hs-per"><thead><tr><th>Leg.</th><th>Nombre y apellido</th><th class="hs-cuilc">CUIL</th><th class="hm">Categoría</th><th>Tipo de puesto</th><th class="hm">Tareas que realizan</th><th>Ingreso</th><th>Preocupacional</th><th></th></tr></thead>';
     es.forEach(function(g){
-      h+='<tbody class="hs-eg"><tr class="hs-grp hs-grp-e"><th colspan="8"><span class="hs-gh"><span class="hs-gt">'+esc(g.k||HS_SINE)+'</span>'+
+      h+='<tbody class="hs-eg"><tr class="hs-grp hs-grp-e"><th colspan="9"><span class="hs-gh"><span class="hs-gt">'+esc(g.k||HS_SINE)+'</span>'+
         (g.sin?'<span class="hs-gs">'+g.sin+' sin preocupacional</span>':'')+'<span class="hs-n">'+g.l.length+(g.l.length===1?' persona':' personas')+'</span></span></th></tr>';
       g.s.forEach(function(sg){
-        h+='<tr class="hs-grp hs-grp-s"><th colspan="8"><span class="hs-gh"><span class="hs-gt">'+esc(sg.k||HS_SINS)+'</span><span class="hs-n">'+sg.l.length+'</span></span></th></tr>';
+        h+='<tr class="hs-grp hs-grp-s"><th colspan="9"><span class="hs-gh"><span class="hs-gt">'+esc(sg.k||HS_SINS)+'</span><span class="hs-n">'+sg.l.length+'</span></span></th></tr>';
         h+=sg.l.map(function(p){
           var L=HS.leg[p.id], tar=(L&&L.tareas)||p.tareas;
-          return '<tr><td class="hs-leg">'+esc(p.leg)+'</td><td class="hs-nm"><button type="button" class="hs-lk" data-hs="per-leg" data-id="'+esc(p.id)+'">'+esc(p.nombre)+'</button></td>'+
+          return '<tr><td class="hs-leg">'+esc(p.leg)+'</td><td class="hs-nm"><button type="button" class="hs-lk" data-hs="per-leg" data-id="'+esc(p.id)+'">'+esc(p.nombre)+'</button>'+(p.cuil?'<small class="hs-cuil-m">CUIL '+esc(hsCuil(p.cuil))+'</small>':'')+'</td>'+
+            '<td class="hs-cuil hs-cuilc">'+(p.cuil?esc(hsCuil(p.cuil)):'<span class="muted">–</span>')+'</td>'+
             '<td class="hm">'+(p.cat?esc(p.cat):'<span class="muted">–</span>')+'</td><td class="hs-area">'+hsAreaChip(p)+'</td><td class="hm hs-tar">'+(tar?esc(tar):'<span class="muted">–</span>')+'</td>'+
             '<td>'+(p.ingreso?esc(fAR(p.ingreso)):'<span class="muted">–</span>')+'</td><td>'+hsPreChip(p.id)+'</td>'+
             '<td class="hs-ac"><button type="button" class="btn sm" data-hs="per-leg" data-id="'+esc(p.id)+'">Legajo</button></td></tr>';
@@ -18506,7 +18589,7 @@ function hsLegDlg(pid){
   var L=HS.leg[pid]||{tareas:'',pre:hsPreItem({})}, pr=L.pre, up=!!S.cu.as&&S.canWrite, w=S.canWrite;
   abrirModal('<form class="dlg hs-dlg" id="hsFormLeg" data-id="'+esc(pid)+'" role="dialog" aria-modal="true" aria-labelledby="dlgT" autocomplete="off">'+
     '<h2 id="dlgT">Legajo · '+esc(p.nombre)+'</h2>'+
-    '<dl class="hs-dl"><div><dt>Legajo</dt><dd>'+esc(p.leg||'–')+'</dd></div><div><dt>Establecimiento</dt><dd>'+esc(hsEstDe(p)||'–')+'</dd></div><div><dt>Sector</dt><dd>'+esc(p.sector||'–')+'</dd></div><div><dt>Tipo de puesto</dt><dd>'+(PER_AREAN[p.area]?esc(PER_AREAN[p.area]):'–')+'</dd></div><div><dt>Categoría</dt><dd>'+esc(p.cat||'–')+'</dd></div>'+
+    '<dl class="hs-dl"><div><dt>Legajo</dt><dd>'+esc(p.leg||'–')+'</dd></div><div><dt>CUIL</dt><dd>'+esc(p.cuil?hsCuil(p.cuil):'–')+'</dd></div><div><dt>Establecimiento</dt><dd>'+esc(hsEstDe(p)||'–')+'</dd></div><div><dt>Sector</dt><dd>'+esc(p.sector||'–')+'</dd></div><div><dt>Tipo de puesto</dt><dd>'+(PER_AREAN[p.area]?esc(PER_AREAN[p.area]):'–')+'</dd></div><div><dt>Categoría</dt><dd>'+esc(p.cat||'–')+'</dd></div>'+
     '<div><dt>Fecha de ingreso</dt><dd>'+(p.ingreso?esc(fAR(p.ingreso))+(hsAnt(p.ingreso)?' <small>('+esc(hsAnt(p.ingreso))+')</small>':''):'–')+'</dd></div></dl>'+
     '<label for="hl-tar">Tareas que realizan <small>'+(p.tareas&&!L.tareas?'(por ahora se toma lo que figura en Administración de personal)':'')+'</small><textarea id="hl-tar" name="tareas" rows="2" maxlength="300"'+(w?'':' disabled')+'>'+esc(L.tareas||p.tareas||'')+'</textarea></label>'+
     '<h3 class="sec">Examen preocupacional</h3>'+
@@ -25588,18 +25671,18 @@ function hlPer(){
   });
   var gk=function(p){ return (hsEstDe(p)||HS_SINE)+' › '+(p.sector||HS_SINS) };
   l.forEach(function(p){ var g=gk(p); cnt[g]=(cnt[g]||0)+1 });
-  csv=[['Legajo','Nombre y apellido','Establecimiento','Sector','Categoría','Tipo de puesto','Tareas que realizan','Fecha de ingreso','Preocupacional','Fecha del examen','Prestador']];
+  csv=[['Legajo','Nombre y apellido','CUIL','Establecimiento','Sector','Categoría','Tipo de puesto','Tareas que realizan','Fecha de ingreso','Preocupacional','Fecha del examen','Prestador']];
   l.forEach(function(p){
     var L=HS.leg[p.id], tar=(L&&L.tareas)||p.tareas||'', pre=hlPre(p.id), g=gk(p), pr=hsTienePre(p.id)?L.pre:null;
     if(pr){ con++; if(pr.res==='no') no++ }
     if(g!==last){ last=g; rows.push({sec:g+' · '+hlN(cnt[g],'persona','personas')}) }
-    rows.push([p.leg,p.nombre,p.cat||'–',hsAreaDe(p),tar||'–',p.ingreso?fAR(p.ingreso):'–',pre]);
-    csv.push([p.leg,p.nombre,hsEstDe(p),p.sector||'',p.cat||'',PER_AREAN[p.area]||'',tar,fAR(p.ingreso),pr?(pr.res?HS_RESN[pr.res]:'Cargado'):HS_SINP,pr?fAR(pr.fecha):'',pr?pr.prest:'']);
+    rows.push([p.leg,p.nombre,p.cuil?hsCuil(p.cuil):'–',p.cat||'–',hsAreaDe(p),tar||'–',p.ingreso?fAR(p.ingreso):'–',pre]);
+    csv.push([p.leg,p.nombre,p.cuil?hsCuil(p.cuil):'',hsEstDe(p),p.sector||'',p.cat||'',PER_AREAN[p.area]||'',tar,fAR(p.ingreso),pr?(pr.res?HS_RESN[pr.res]:'Cargado'):HS_SINP,pr?fAR(pr.fecha):'',pr?pr.prest:'']);
   });
   return {a:'s',slug:'personal-preocupacional',titulo:'Personal · Examen preocupacional',
     sub:[hlCab('s'),'Personal activo por establecimiento y sector · el examen preocupacional es un dato de salud'].concat(hlFil(fil)),
     resumen:[[l.length,l.length===1?'Persona':'Personas'],[con,'Con preocupacional'],[l.length-con,'Sin cargar'],[no,'No apto']],
-    head:['Leg.','Nombre y apellido','Categoría','Tipo de puesto','Tareas que realizan','Ingreso','Preocupacional'],rows:rows,cen:[0,5],ori:'h',tam:9,csv:csv,n:l.length,un:['persona','personas']};
+    head:['Leg.','Nombre y apellido','CUIL','Categoría','Tipo de puesto','Tareas que realizan','Ingreso','Preocupacional'],rows:rows,cen:[0,2,6],ori:'h',tam:9,csv:csv,n:l.length,un:['persona','personas']};
 }
 
 /* ---------- Plan anual de capacitación ---------- */
